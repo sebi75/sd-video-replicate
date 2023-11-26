@@ -18,13 +18,15 @@ from torchvision.transforms import ToTensor
 # local imports
 from utils.nsfw_and_watermark_dectection import DeepFloydDataFiltering
 from utils.helpers import embed_watermark, default, instantiate_from_config
+from sizing_strategy import SizingStrategy
 
 
 class Predictor(BasePredictor):
     def setup(self) -> None:
         """Load the model into memory to make running multiple predictions efficient"""
-        self.device = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu")
+        self.sizing_strategy = SizingStrategy()
+
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         self.svd_num_frames = 14
         svd_num_steps = 25
@@ -54,7 +56,7 @@ class Predictor(BasePredictor):
     @torch.inference_mode()
     def predict(
         self,
-        input_path: Path = Input(
+        input_image: Path = Input(
             description="Path to the input image file or folder with image files",
         ),
         num_frames: int = Input(
@@ -65,10 +67,15 @@ class Predictor(BasePredictor):
             description="Version of the model",
             default="svd"
         ),
-        fps_id: int = Input(
-            description="FPS ID for video processing",
-            default=6
-        ),
+        sizing_strategy: str = Input(
+            description="Decide how to resize the input image",
+            choices=[
+                "maintain_aspect_ratio",
+                "crop_to_16_9",
+                "use_image_dimensions",
+            ],
+            default="maintain_aspect_ratio",
+        )
         motion_bucket_id: int = Input(
             description="Motion bucket ID for video processing",
             default=127
@@ -88,41 +95,39 @@ class Predictor(BasePredictor):
             ge=0
         ),
     ) -> Path:
-        """
-        Simple script to generate a single sample conditioned on an image `input_path` or multiple images, one for each
-        image file in folder `input_path`. If you run out of VRAM, try decreasing `decoding_t`.
-        """
         # check that the version is valid
+        output_folder: Optional[str] = "tmp/"
         if version != "svd" and version != "svd_xt":
             raise ValueError(f"Version {version} does not exist.")
         torch.manual_seed(seed)
+
+        # set the model and filter
+        model = self.svd_model if version == "svd" else self.svdxt_model
         filter = self.svd_filter if version == "svd" else self.svdxt_filter
 
         if version == "svd":
             num_frames = default(self.svd_num_frames, 14)
         elif version == "svd_xt":
             num_frames = default(self.svdxt_num_frames, 25)
+        
+        image = self.sizing_strategy.apply(sizing_strategy, input_image)
 
-        output_folder = default(output_folder, "/tmp")
 
-        path = PathlibPath(input_path)
-        if not path.is_file() or not any([input_path.endswith(x) for x in ["jpg", "jpeg", "png"]]):
-            raise ValueError("Path is not valid image file.")
+        # add validation that the input file is a file and image
 
-        with Image.open(input_path) as image:
-            if image.mode == "RGBA":
-                image = image.convert("RGB")
-            w, h = image.size
+        if image.mode == "RGBA":
+            image = image.convert("RGB")
+        w, h = image.size
 
-            if h % 64 != 0 or w % 64 != 0:
-                width, height = map(lambda x: x - x % 64, (w, h))
-                image = image.resize((width, height))
-                print(
-                    f"WARNING: Your image is of size {h}x{w} which is not divisible by 64. We are resizing to {height}x{width}!"
-                )
+        if h % 64 != 0 or w % 64 != 0:
+            width, height = map(lambda x: x - x % 64, (w, h))
+            image = image.resize((width, height))
+            print(
+                f"WARNING: Your image is of size {h}x{w} which is not divisible by 64. We are resizing to {height}x{width}!"
+            )
 
-            image = ToTensor()(image)
-            image = image * 2.0 - 1.0
+        image = ToTensor()(image)
+        image = image * 2.0 - 1.0
 
         image = image.unsqueeze(0).to(self.device)
         H, W = image.shape[2:]
@@ -153,11 +158,11 @@ class Predictor(BasePredictor):
         value_dict["cond_frames"] = image + cond_aug * torch.randn_like(image)
         value_dict["cond_aug"] = cond_aug
 
-        result_video_paths = []
+        output_path = None
         with torch.no_grad():
             with torch.autocast(self.device):
                 batch, batch_uc = self.get_batch(
-                    get_unique_embedder_keys_from_conditioner(
+                    self.get_unique_embedder_keys_from_conditioner(
                         model.conditioner),
                     value_dict,
                     [1, num_frames],
@@ -201,31 +206,34 @@ class Predictor(BasePredictor):
                     (samples_x + 1.0) / 2.0, min=0.0, max=1.0)
 
                 os.makedirs(output_folder, exist_ok=True)
-                random_uuid = uuid.uuid4()
-                video_path = os.path.join(
-                    output_folder, f"{random_uuid}.mp4")
-                result_video_paths.append(video_path)
-                writer = cv2.VideoWriter(
-                    video_path,
-                    cv2.VideoWriter_fourcc(*"MP4V"),
-                    fps_id + 1,
-                    (samples.shape[-1], samples.shape[-2]),
-                )
+                base_count = len(glob(os.path.join(output_folder, "*.mp4")))
+                video_path = os.path.join(output_folder, f"{base_count:06d}.mp4")
+                
+                output_path = video_path
 
                 samples = embed_watermark(samples)
-                samples = filter(samples)
                 vid = (
                     (rearrange(samples, "t c h w -> t h w c") * 255)
                     .cpu()
                     .numpy()
                     .astype(np.uint8)
                 )
-                for frame in vid:
+                # Save frames as individual images
+                for i, frame in enumerate(vid):
                     frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                    writer.write(frame)
-                writer.release()
-        resulted_video = result_video_paths[0]
-        return Path(resulted_video)
+                    cv2.imwrite(
+                        os.path.join(output_folder, f"frame_{i:06d}.png"), frame
+                    )
+
+                # Use ffmpeg to create video from images
+                os.system(
+                    f"ffmpeg -r {frames_per_second + 1} -i {output_folder}/frame_%06d.png -c:v libx264 -vf 'fps={frames_per_second + 1},format=yuv420p' {video_path}"
+                )
+
+                # Remove individual frame images
+                for file_name in glob(os.path.join(output_folder, "*.png")):
+                    os.remove(file_name)
+        return Path(output_path)
 
     def get_unique_embedder_keys_from_conditioner(self, conditioner):
         return list(set([x.input_key for x in conditioner.embedders]))
