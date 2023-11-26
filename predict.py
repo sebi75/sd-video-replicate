@@ -18,7 +18,7 @@ from torchvision.transforms import ToTensor
 # local imports
 from utils.nsfw_and_watermark_dectection import DeepFloydDataFiltering
 from utils.helpers import embed_watermark, default, instantiate_from_config
-from sizing_strategy import SizingStrategy
+from utils.sizing_strategy import SizingStrategy
 
 
 class Predictor(BasePredictor):
@@ -65,6 +65,10 @@ class Predictor(BasePredictor):
         ),
         version: str = Input(
             description="Version of the model",
+            choices=[
+                "svd",
+                "svd_xt",
+            ],
             default="svd"
         ),
         sizing_strategy: str = Input(
@@ -75,7 +79,7 @@ class Predictor(BasePredictor):
                 "use_image_dimensions",
             ],
             default="maintain_aspect_ratio",
-        )
+        ),
         motion_bucket_id: int = Input(
             description="Motion bucket ID for video processing",
             default=127
@@ -89,6 +93,8 @@ class Predictor(BasePredictor):
             description="Seed for random number generation",
             default=23
         ),
+        fps_id: int = Input(description="Frames per second",
+                            default=6, ge=5, le=30),
         decoding_t: int = Input(
             description="Number of frames decoded at a time, affects VRAM usage",
             default=14,
@@ -106,14 +112,11 @@ class Predictor(BasePredictor):
         filter = self.svd_filter if version == "svd" else self.svdxt_filter
 
         if version == "svd":
-            num_frames = default(self.svd_num_frames, 14)
+            num_frames = default(num_frames, self.svd_num_frames)
         elif version == "svd_xt":
-            num_frames = default(self.svdxt_num_frames, 25)
-        
+            num_frames = default(num_frames, self.svdxt_num_frames)
+
         image = self.sizing_strategy.apply(sizing_strategy, input_image)
-
-
-        # add validation that the input file is a file and image
 
         if image.mode == "RGBA":
             image = image.convert("RGB")
@@ -207,8 +210,9 @@ class Predictor(BasePredictor):
 
                 os.makedirs(output_folder, exist_ok=True)
                 base_count = len(glob(os.path.join(output_folder, "*.mp4")))
-                video_path = os.path.join(output_folder, f"{base_count:06d}.mp4")
-                
+                video_path = os.path.join(
+                    output_folder, f"{base_count:06d}.mp4")
+
                 output_path = video_path
 
                 samples = embed_watermark(samples)
@@ -222,12 +226,13 @@ class Predictor(BasePredictor):
                 for i, frame in enumerate(vid):
                     frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                     cv2.imwrite(
-                        os.path.join(output_folder, f"frame_{i:06d}.png"), frame
+                        os.path.join(
+                            output_folder, f"frame_{i:06d}.png"), frame
                     )
 
                 # Use ffmpeg to create video from images
                 os.system(
-                    f"ffmpeg -r {frames_per_second + 1} -i {output_folder}/frame_%06d.png -c:v libx264 -vf 'fps={frames_per_second + 1},format=yuv420p' {video_path}"
+                    f"ffmpeg -r {fps_id + 1} -i {output_folder}/frame_%06d.png -c:v libx264 -vf 'fps={fps_id + 1},format=yuv420p' {video_path}"
                 )
 
                 # Remove individual frame images
